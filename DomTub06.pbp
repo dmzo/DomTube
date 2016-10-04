@@ -1,0 +1,322 @@
+'COMBAT TAG DOMINATION TUBE
+'Code Version: 06
+'Words Used = 982
+'Revision Date: 7 Aug 2010
+'Written for PICBasic Pro Compiler version 2.50 (www.melabs.com)
+'Processor=PIC16F684  (WDT=ON; MCLR=OFF; OSC=INTRC)
+
+    DEFINE OSC 8
+    
+	'EEPROM 50, [12]        'Game Time (minutes)  12 = 12 minutes
+
+'*************************************************************	
+'*************************************************************
+'******************** DEFINE CONSTANTS ***********************
+'*************************************************************
+'*************************************************************
+carrier_set VAR BYTE				'PWM Period (40K=49, 56K=35)
+
+mtheader    CON 2400
+mtbit0      CON 600
+mtbit1      CON 1200
+mtspace     CON 600
+
+write_delay CON 10
+
+'*************************************************************
+'*************************************************************
+'******************** DEFINE VARIABLES ***********************
+'*************************************************************
+'*************************************************************
+bad_data            VAR BIT 		
+
+buffer              VAR BYTE[33]
+
+temp			VAR BYTE
+temp2			VAR BYTE
+temp3			VAR WORD
+
+player          VAR BYTE
+team			VAR BYTE
+myteam          VAR BYTE
+
+team_id         VAR buffer[1]
+player_id       VAR buffer[2]
+
+bit_counter         VAR BYTE
+checksum            VAR BYTE BANK1
+damage              VAR BYTE BANK1
+databyte            VAR BYTE	
+databyte1           VAR BYTE
+delay_time          VAR BYTE
+delay_count         VAR BYTE
+dip_time            VAR BYTE
+hit_detect          VAR BYTE
+itemID              VAR BYTE BANK1
+length              VAR BYTE
+main_loop_timer 	VAR WORD BANK1
+message         	VAR BYTE BANK1
+message_ID		    VAR BYTE BANK1
+
+state               VAR BYTE BANK1
+
+vcount              VAR BYTE 
+vdelay              VAR BYTE
+
+ptemp               VAR BYTE
+autoreset           VAR BYTE
+game_time		    VAR WORD
+game_win		    VAR WORD
+alpha_time		    VAR WORD
+bravo_time		    VAR WORD
+
+'*************************************************************
+'*************************************************************
+'******************** PIN ASSIGNMENTS ************************
+'*************************************************************
+'*************************************************************
+Symbol ir_in 		= PORTA.2			'IR Sensor Input
+Symbol calibrate    = PORTC.0			'Calibration Output
+Symbol lampA	    = PORTC.2			'RED LIGHTS
+Symbol lampB 	    = PORTC.5         	'BLUE LIGHTS
+SYMBOL dip_1        = PORTA.5           'V2 RevA                  
+SYMBOL dip_2        = PORTA.4           'V2 RevA 
+SYMBOL dip_4        = PORTA.0           'V2 RevA   (A2 on Gadget Board)
+SYMBOL dip_8        = PORTA.1           'V2 RevA 
+	
+'*************************************************************
+'*************************************************************
+'******************** INITIALIZATION *************************
+'*************************************************************
+'*************************************************************
+	ON INTERRUPT GOTO hit_int
+    
+	DISABLE
+	
+	GOTO initialize
+    INCLUDE "asm_rout.inc"		'assembly subroutines	
+
+initialize:
+    CLEAR
+	OSCCON = %01111000			'8MHz
+	CMCON0 = 7				    'turn off comparators
+	ANSEL = 0
+	
+	CCPR1L = 15				    'PWM Duty Cycle (1 to 15)
+	OPTION_REG = %00000100		'Turn PortA weak pull-ups, TMR0 Prescale/32
+
+	IOCA =  %000000				'disable PORTA.0 Int On Change
+	WPUA =  %110011				'enable weak pull-ups PortA
+
+'------------------------- TIMER 0 --------------------------
+						       'Timer 0 is used for Input Pulse Measurement	
+	TMR0 = 0				   'clear Timer 0 
+	INTCON.5 = 0               'disable TMR0 interrupt
+
+'------------------------- TIMER 1 --------------------------
+                                'Timer 1 is for Elapsed Time		
+	TMR1H = 0					'clear Timer 1 high byte
+	TMR1L = 0					'clear Timer 1 low byte
+    T1CON = 1					'turn Timer 1 on
+	PIE1.0 = 1              	'enable Timer 1 interrupt flag
+	PIR1.0 = 0                  'clear overflow flag
+	INTCON.6 = 1
+
+'------------------------- TIMER 2 --------------------------
+                            'Timer 2 is used for PWM module(s)	
+	T2CON = 4				'Timer2 = ON; Prescale = 1:1
+	CCP1CON = 0				'PWM module off
+
+'------------------------------------------------------------
+	TRISA = %111111    		'set PortA directions
+	TRISC = %000000    		'set PortC directions
+
+	PORTA = %000000
+	PORTC = %000000    		'
+
+'*************************************************************
+'*************************************************************
+'*************************************************************
+power_on_inits:					'before respawn entry
+    'READ 50, game_time          'minutes
+    
+    dip_time = 0
+    dip_time.0 = dip_1
+    dip_time.1 = dip_2
+        
+    dip_time = dip_time ^ %00000011     'Invert LS 3 bits
+                                        'We must invert because DIP Switch ON = 0
+    
+    Lookup dip_time,[10,15,20,25],game_time
+	
+	game_time = game_time * 120
+	
+    IF dip_8 = 0 THEN 
+        game_win = 9999             'DIP 8 = ON (End Win)
+    ELSE
+        game_win = game_time / 2    'DIP 8 = OFF  (Domination Win)
+    ENDIF
+    
+	LOW lampA
+	LOW lampB
+    PAUSE 400
+    
+ok_flash:                   'Test LEDs and Indicate Settings
+    temp2 = dip_time + 1
+	
+    FOR temp = 1 to temp2   'Flash RED LED to indicate Game Timer Setting 
+        HIGH lampA          '1 Flash = 10 minutes
+        PAUSE 400           '2 Flash = 15 minutes
+        LOW lampA           '3 Flash = 20 minutes
+        PAUSE 250           '4 Flash = 25 minutes
+    NEXT temp
+    
+    PAUSE 400
+
+        HIGH lampB       'Flash BLUE LED 1 time for "Domination Win"
+        PAUSE 600
+        LOW lampB
+        PAUSE 250
+                
+    IF game_win = 9999 THEN       'Flash BLUE LED 2 times for "End Win"
+        HIGH lampB
+        PAUSE 400
+        LOW lampB
+    ENDIF
+                
+	state = 0
+	alpha_time = 0
+	bravo_time = 0
+	LOW lampA
+	LOW lampB 
+    
+   
+'INTERRUPT INITIALIZE
+	INTCON = $80          'global interrupt enable
+	INTCON.4   = 1        'enable INT
+	OPTION_REG.6  = 0        'falling edge
+	INTCON.1   = 0        'clear INT flag
+	INTCON.5   = 0        'disable TMR0 interrupt
+	
+    ENABLE	
+
+'*************************************************************	
+'*************************************************************
+'********************* MAIN PROGRAM **************************
+'*************************************************************
+'*************************************************************
+start:
+
+main_loop:
+	FOR temp = 1 to 48			'wait
+    	delay_time = 100  
+        GOSUB intdelay
+	NEXT temp
+	
+	TOGGLE calibrate                       'calibration output
+
+	IF state != 0 OR game_win = 9999 THEN    'Any team in control yet?
+        game_time = game_time - 1		     'timer decrement
+	ENDIF
+	
+	IF game_time = 0 THEN game_over
+	IF alpha_time > game_win THEN alpha_win
+	IF bravo_time > game_win THEN bravo_win
+
+	IF state = 1 THEN
+		alpha_time = alpha_time + 1
+	ENDIF
+
+	IF state = 2 THEN
+		bravo_time = bravo_time + 1
+	ENDIF
+
+	GOTO main_loop
+	
+'-----------------------------------------------------------
+'-----------------------------------------------------------
+'-----------------------------------------------------------
+game_over:
+    IF game_win = 9999 THEN                 'End Game Win
+        IF state = 1 THEN alpha_win
+        IF state = 2 THEN bravo_win        
+    ENDIF
+    state  = 3                              'Domination Win
+	IF alpha_time > bravo_time THEN alpha_win
+	IF alpha_time < bravo_time THEN bravo_win
+
+tie_score:
+    state  = 3
+	HIGH lampA
+	LOW lampB
+    	FOR temp = 1 to 20			'delay 400mS
+        	delay_time = 100  
+            GOSUB intdelay
+    	NEXT temp
+	LOW lampA
+	HIGH lampB
+    	FOR temp = 1 to 20			'delay 400mS
+        	delay_time = 100  
+            GOSUB intdelay
+    	NEXT temp
+
+	GOTO tie_score
+
+alpha_win:
+    state  = 3
+    temp3 = alpha_time - bravo_time
+    IF temp3 < 11 THEN tie_score
+    
+	LOW lampB
+	
+	FOR autoreset = 1 to 200
+    	HIGH lampA
+        	FOR temp = 1 to 20			'delay 400mS
+            	delay_time = 100  
+                GOSUB intdelay
+        	NEXT temp
+    	LOW lampA
+        	FOR temp = 1 to 20			'delay 400mS
+            	delay_time = 100  
+                GOSUB intdelay
+        	NEXT temp
+    NEXT autoreset
+    
+	GOTO initialize
+
+bravo_win:
+    state  = 3
+    temp3 = bravo_time - alpha_time
+    IF temp3 < 11 THEN tie_score
+    
+	LOW lampA
+	
+	FOR autoreset = 1 to 200
+    	HIGH lampB
+        	FOR temp = 1 to 20			'delay 400mS
+            	delay_time = 100  
+                GOSUB intdelay
+        	NEXT temp
+    	LOW lampB
+        	FOR temp = 1 to 20			'delay 400mS
+            	delay_time = 100  
+                GOSUB intdelay
+        	NEXT temp
+    NEXT autoreset
+    
+	GOTO initialize
+	
+
+
+    DISABLE
+'*************************************************************
+'*************************************************************
+	INCLUDE "interrupt.inc"     	'interrupt handler
+	INCLUDE "sys_mssg.inc"      	'system message handler
+	INCLUDE "sub_rout.inc"
+
+'*************************************************************
+'*************************************************************
+
+	End
+
